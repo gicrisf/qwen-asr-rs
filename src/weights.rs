@@ -5,8 +5,10 @@ use safetensors::{Dtype, SafeTensors, SafeTensorError};
 use thiserror::Error;
 use half::{bf16, f16};
 
+use std::convert::TryFrom;
+
 #[derive(Debug, Error)]
-enum WeightsError {
+pub enum WeightsError {
     #[error("failed to read weights file: {0}")]
     Io(#[from] std::io::Error),
     #[error("failed to parse safetensors: {0}")]
@@ -18,13 +20,28 @@ enum WeightsError {
 }
 
 // name -> (dtype, flat byte data)
-#[derive(Default)]
-struct Weights(HashMap<String, (Dtype, Vec<u8>)>);
+#[derive(Default, Debug)]
+pub struct Weights(HashMap<String, (Dtype, Vec<u8>)>);
 
-type Result<T> = std::result::Result<T, WeightsError>;
+impl TryFrom<&[u8]> for Weights {
+    type Error = WeightsError;
+
+    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        Self::from_bytes(data)
+    }
+}
+
+impl TryFrom<&Path> for Weights {
+    type Error = WeightsError;
+
+    fn try_from(path: &Path) -> Result<Self, Self::Error> {
+        let data = std::fs::read(path)?;
+        Self::from_bytes(&data)
+    }
+}
 
 impl Weights {
-    fn from_files(paths: &[impl AsRef<Path>]) -> Result<Self> {
+    pub(crate) fn from_files(paths: &[impl AsRef<Path>]) -> Result<Self, WeightsError> {
         paths.iter()
              .try_fold(Self::default(), |mut acc, path| {
                  let path = path.as_ref();
@@ -32,18 +49,24 @@ impl Weights {
                  // If so, we read it...
                  let data = std::fs::read(path)?;
                  // ... and we parse it
-                 let st = SafeTensors::deserialize(&data)?;
-
-                 for (name, view) in st.tensors() {
-                     acc.0.insert(name.to_string(), (view.dtype(), view.data().to_vec()));
-                 }
-
+                 let weights = Self::from_bytes(&data)?;
+                 acc.0.extend(weights.0);
                  Ok(acc)
              })
     }
 
+    pub(crate) fn from_bytes(data: &[u8]) -> Result<Self, WeightsError> {
+        let st = SafeTensors::deserialize(data)?;
+        let mut acc = Self::default();
+        for (name, view) in st.tensors() {
+            acc.0
+               .insert(name.to_string(), (view.dtype(), view.data().to_vec()));
+        }
+        Ok(acc)
+    }
+
     /// Load a tensor as flat f32 vector
-    fn get_f32(&self, name: &str) -> Result<Vec<f32>> {
+    fn get_f32(&self, name: &str) -> Result<Vec<f32>, WeightsError> {
         let (dtype, bytes) = self
             .0
             .get(name)
@@ -76,7 +99,7 @@ impl Weights {
     }
 
     /// Load a BF16 tensor as raw u16 bits (for decoding)
-    fn get_raw_bf16(&self, name: &str) -> Result<Vec<u16>> {
+    fn get_raw_bf16(&self, name: &str) -> Result<Vec<u16>, WeightsError> {
         let (dtype, bytes) = self
             .0
             .get(name)
@@ -94,13 +117,16 @@ impl Weights {
            .map(|b| u16::from_le_bytes([b[0], b[1]]))
            .collect())
     }
+
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn get_f32_reads_f32_tensor() {
@@ -114,21 +140,11 @@ mod tests {
         tensors.insert("weight".to_string(), view);
 
         let serialized = safetensors::tensor::serialize(tensors, None).unwrap();
-
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("qwen-asr-test-{suffix}.safetensors"));
-
-        std::fs::write(&path, serialized).unwrap();
-
-        let weights = Weights::from_files(&[&path]).unwrap();
+        let weights = Weights::from_bytes(&serialized).unwrap();
 
         let values = weights.get_f32("weight").unwrap();
         assert_eq!(values, vec![1.0f32, 2.0f32]);
 
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -140,20 +156,10 @@ mod tests {
         tensors.insert("weight".to_string(), view);
 
         let serialized = safetensors::tensor::serialize(tensors, None).unwrap();
-
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("qwen-asr-test-{suffix}.safetensors"));
-
-        std::fs::write(&path, serialized).unwrap();
-
-        let weights = Weights::from_files(&[&path]).unwrap();
+        let weights = Weights::from_bytes(&serialized).unwrap();
 
         let bits = weights.get_raw_bf16("weight").unwrap();
         assert_eq!(bits, vec![0x3f80u16, 0x4000u16]);
 
-        let _ = std::fs::remove_file(path);
     }
 }

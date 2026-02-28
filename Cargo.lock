@@ -762,6 +762,7 @@ dependencies = [
  "candle-nn",
  "half",
  "safetensors",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

@@ -1,12 +1,10 @@
 mod weights;
-
-#[allow(dead_code)]
-enum Model {
-    Qwen06b,
-    Qwen17b
-}
+mod encoder;
+mod decoder;
+mod audio;
+mod model;
+mod preset;
 
 fn main() {
     println!("Hello, world!");
 }
-
