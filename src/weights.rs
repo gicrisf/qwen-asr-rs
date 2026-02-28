@@ -19,9 +19,9 @@ pub enum WeightsError {
     WrongDtype { name: String, dtype: Dtype },
 }
 
-// name -> (dtype, flat byte data)
+// name -> (dtype, shape, flat byte data)
 #[derive(Default, Debug)]
-pub struct Weights(HashMap<String, (Dtype, Vec<u8>)>);
+pub struct Weights(HashMap<String, (Dtype, Vec<usize>, Vec<u8>)>);
 
 impl TryFrom<&[u8]> for Weights {
     type Error = WeightsError;
@@ -60,14 +60,14 @@ impl Weights {
         let mut acc = Self::default();
         for (name, view) in st.tensors() {
             acc.0
-               .insert(name.to_string(), (view.dtype(), view.data().to_vec()));
+               .insert(name.to_string(), (view.dtype(), view.shape().to_vec(), view.data().to_vec()));
         }
         Ok(acc)
     }
 
     /// Load a tensor as flat f32 vector
-    fn get_f32(&self, name: &str) -> Result<Vec<f32>, WeightsError> {
-        let (dtype, bytes) = self
+    pub(crate) fn get_f32(&self, name: &str) -> Result<Vec<f32>, WeightsError> {
+        let (dtype, _shape, bytes) = self
             .0
             .get(name)
             .ok_or_else(|| WeightsError::MissingTensor(name.to_string()))?;
@@ -100,7 +100,7 @@ impl Weights {
 
     /// Load a BF16 tensor as raw u16 bits (for decoding)
     fn get_raw_bf16(&self, name: &str) -> Result<Vec<u16>, WeightsError> {
-        let (dtype, bytes) = self
+        let (dtype, _shape, bytes) = self
             .0
             .get(name)
             .ok_or_else(|| WeightsError::MissingTensor(name.to_string()))?;
@@ -116,6 +116,10 @@ impl Weights {
            .chunks_exact(2)
            .map(|b| u16::from_le_bytes([b[0], b[1]]))
            .collect())
+    }
+
+    pub(crate) fn shape_of(&self, name: &str) -> Option<&[usize]> {
+        self.0.get(name).map(|(_, shape, _)| shape.as_slice())
     }
 
     pub fn has_tensor(&self, name: &str) -> bool {

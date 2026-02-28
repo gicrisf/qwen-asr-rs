@@ -101,3 +101,37 @@ impl Model {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use std::path::PathBuf;
+
+    fn smoke_model_dir() -> PathBuf {
+        if let Ok(model_dir) = env::var("QWEN_ASR_MODEL_DIR") {
+            let p = PathBuf::from(model_dir);
+            return if p.is_file() {
+                p.parent().map_or_else(|| p.clone(), PathBuf::from)
+            } else {
+                p
+            };
+        }
+        if let Ok(root) = env::var("QWEN_ASR_ROOT") {
+            return PathBuf::from(root).join("qwen3-asr-1.7b");
+        }
+        panic!(
+            "Set QWEN_ASR_MODEL_DIR=/abs/path/to/model-dir \
+or QWEN_ASR_ROOT=/abs/path/to/repo-root"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn load_from_dir_smoke() {
+        let model_dir = smoke_model_dir();
+        let model = Model::load_from_dir(&model_dir);
+        println!("{:#?}", model);
+        assert!(model.is_ok());
+    }
+}
