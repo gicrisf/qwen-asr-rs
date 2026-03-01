@@ -21,7 +21,6 @@ pub fn load(
 mod tests {
     use super::*;
     use crate::preset::ModelPreset;
-    use crate::weights::Weights;
     use std::env;
     use std::path::PathBuf;
 
@@ -50,8 +49,7 @@ mod tests {
     //   DEC_DEBUG embed[0..4] = -0.0075378418 -0.097167969 0.016113281 0.047607422
     fn embed_lookup_matches_c_reference() {
         let shard = smoke_shard_path();
-        let weights = Weights::from_files(&[&shard]).expect("failed to load weights");
-        let cfg = ModelPreset::from(&weights).config().decoder;
+        let cfg = ModelPreset::Qwen3Asr0_6b.config().decoder;
         let mut dec = load(&[&shard], &cfg, &Device::Cpu).expect("load failed");
 
         // Feed token 151644 (<|im_start|>) and get logits — the embed is looked up
@@ -64,12 +62,19 @@ mod tests {
         assert!(logits_vec.iter().all(|v| v.is_finite()), "logits contain NaN/inf");
 
         // Verify the embedding of token 151644 matches the C reference.
-        // The Decoder loads embed_tokens from thinker.model.embed_tokens.weight [vocab, hidden].
-        // We load that tensor independently and check the first 4 values of row 151644.
-        let embed_w = weights.get_f32("thinker.model.embed_tokens.weight")
-            .expect("embed_tokens weight");
-        let hidden = cfg.hidden_size;
-        let row = &embed_w[151644 * hidden .. 151644 * hidden + 4];
+        // Load embed_tokens.weight independently via a second VarBuilder.
+        let vb = unsafe {
+            VarBuilder::from_mmaped_safetensors(&[&shard], DType::F32, &Device::Cpu).unwrap()
+        };
+        let embed_w = vb
+            .pp("thinker.model")
+            .get((cfg.vocab_size, cfg.hidden_size), "embed_tokens.weight")
+            .unwrap();
+        let row = embed_w
+            .narrow(0, 151644, 1).unwrap()
+            .squeeze(0).unwrap()
+            .narrow(0, 0, 4).unwrap()
+            .to_vec1::<f32>().unwrap();
         let reference = [-0.0075378418f32, -0.097167969, 0.016113281, 0.047607422];
         for (i, (&got, &expected)) in row.iter().zip(reference.iter()).enumerate() {
             let diff = (got - expected).abs();
@@ -81,10 +86,7 @@ mod tests {
     #[ignore]
     fn load_0_6b_decoder_smoke() {
         let shard = smoke_shard_path();
-
-        let weights = Weights::from_files(&[&shard]).expect("failed to load weights");
-        let cfg = ModelPreset::from(&weights).config().decoder;
-
+        let cfg = ModelPreset::Qwen3Asr0_6b.config().decoder;
         let mut dec = load(&[&shard], &cfg, &Device::Cpu).expect("load failed");
 
         // One token forward: token 0, offset 0  →  logits [1, 1, vocab_size]

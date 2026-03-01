@@ -1,4 +1,3 @@
-mod weights;
 mod encoder;
 mod decoder;
 mod audio;

@@ -5,7 +5,6 @@ use candle_transformers::models::qwen3::Config as Qwen3Config;
 
 use std::path::{Path, PathBuf};
 use thiserror::Error;
-use crate::weights::Weights;
 
 #[derive(Debug, Error)]
 enum ModelError {
@@ -85,9 +84,7 @@ impl Model {
             // We could get everything
             // let weights = Weights::from_files(&shards);
 
-            Ok(Model {
-                config: ModelPreset::Qwen3Asr1_7b.config()
-            })
+            Ok(Model { config: ModelPreset::from_dir(model_dir).config() })
         } else {
             // no index? let's go for a single shard
             let single_shard = model_dir.join("model.safetensors");
@@ -95,9 +92,7 @@ impl Model {
                 return Err(ModelError::MissingWeights(format!("{:?}", model_dir)))
             }
 
-            Ok(Model {
-                config: ModelPreset::Qwen3Asr0_6b.config()
-            })
+            Ok(Model { config: ModelPreset::from_dir(model_dir).config() })
         }
     }
 }

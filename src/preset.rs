@@ -1,19 +1,20 @@
+use std::path::Path;
+
 use crate::audio::AudioConfig;
 use crate::encoder::EncoderConfig;
 use crate::model::ModelConfig;
-use crate::weights::Weights;
 use candle_transformers::models::qwen3::Config as Qwen3Config;
-
-use std::convert::From;
 
 pub enum ModelPreset {
     Qwen3Asr0_6b,
     Qwen3Asr1_7b,
 }
 
-impl From<&Weights> for ModelPreset {
-    fn from(weights: &Weights) -> Self {
-        if weights.has_tensor("thinker.audio_tower.layers.18.self_attn.q_proj.weight") {
+impl ModelPreset {
+    /// Detect model variant from the model directory.
+    /// 1.7b is distributed as multiple shards with an index file; 0.6b as a single shard.
+    pub fn from_dir(dir: &Path) -> Self {
+        if dir.join("model.safetensors.index.json").exists() {
             ModelPreset::Qwen3Asr1_7b
         } else {
             ModelPreset::Qwen3Asr0_6b
@@ -86,42 +87,23 @@ impl ModelPreset {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use safetensors::Dtype;
+    use std::env;
 
-    fn write_weights(tensors: HashMap<String, safetensors::tensor::TensorView<'_>>) -> Weights {
-        let serialized = safetensors::tensor::serialize(tensors, None).unwrap();
-        Weights::from_bytes(&serialized).unwrap()
+    #[test]
+    fn detects_1_7b_when_index_file_present() {
+        let dir = env::temp_dir().join("qwen_preset_test_1_7b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let index = dir.join("model.safetensors.index.json");
+        std::fs::write(&index, "{}").unwrap();
+        assert!(matches!(ModelPreset::from_dir(&dir), ModelPreset::Qwen3Asr1_7b));
+        std::fs::remove_file(&index).unwrap();
     }
 
     #[test]
-    fn detects_1_7b_when_discriminator_tensor_present() {
-        let raw = vec![0u8; 4];
-        let view = safetensors::tensor::TensorView::new(Dtype::F32, vec![1], &raw).unwrap();
-
-        let mut tensors = HashMap::new();
-        tensors.insert(
-            "thinker.audio_tower.layers.18.self_attn.q_proj.weight".to_string(),
-            view,
-        );
-
-        let weights = write_weights(tensors);
-        let preset = ModelPreset::from(&weights);
-
-        assert!(matches!(preset, ModelPreset::Qwen3Asr1_7b));
-    }
-
-    #[test]
-    fn defaults_to_0_6b_when_discriminator_tensor_missing() {
-        let raw = vec![0u8; 4];
-        let view = safetensors::tensor::TensorView::new(Dtype::F32, vec![1], &raw).unwrap();
-
-        let mut tensors = HashMap::new();
-        tensors.insert("some.other.tensor".to_string(), view);
-
-        let weights = write_weights(tensors);
-        let preset = ModelPreset::from(&weights);
-
-        assert!(matches!(preset, ModelPreset::Qwen3Asr0_6b));
+    fn detects_0_6b_when_no_index_file() {
+        let dir = env::temp_dir().join("qwen_preset_test_0_6b");
+        std::fs::create_dir_all(&dir).unwrap();
+        let _ = std::fs::remove_file(dir.join("model.safetensors.index.json"));
+        assert!(matches!(ModelPreset::from_dir(&dir), ModelPreset::Qwen3Asr0_6b));
     }
 }

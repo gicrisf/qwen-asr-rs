@@ -1,17 +1,12 @@
-use candle_core::{DType, Device, Tensor};
-use candle_nn::{ops::softmax_last_dim, Conv2d, Conv2dConfig, LayerNorm, Linear, Module};
 use std::fmt;
-use thiserror::Error;
+use std::path::Path;
 
-use crate::weights::{Weights, WeightsError};
-
-#[derive(Debug, Error)]
-pub enum EncoderError {
-    #[error("weights error: {0}")]
-    Weights(#[from] WeightsError),
-    #[error("candle error: {0}")]
-    Candle(#[from] candle_core::Error),
-}
+use candle_core::{DType, Device, Tensor};
+use candle_nn::{
+    conv2d, layer_norm, linear, linear_no_bias,
+    ops::softmax_last_dim,
+    Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderConfig {
@@ -55,37 +50,6 @@ pub struct Encoder {
     cfg: EncoderConfig,
 }
 
-// --- private loading helpers ---
-
-// All encoder tensors are stored as BF16 in the file (~356 MB for 0.6b).
-// Loading as F32 doubles that to ~712 MB. We accept this for now; switching
-// to native BF16 would require using get_bf16 + DType::BF16 throughout.
-fn load_tensor(w: &Weights, name: &str, dev: &Device) -> Result<Tensor, EncoderError> {
-    let data = w.get_f32(name)?;
-    let shape = w.shape_of(name)
-        .ok_or_else(|| WeightsError::MissingTensor(name.to_string()))?;
-    Ok(Tensor::from_vec(data, shape, dev)?)
-}
-
-fn mk_linear(w: &Weights, wname: &str, bname: Option<&str>, dev: &Device) -> Result<Linear, EncoderError> {
-    let weight = load_tensor(w, wname, dev)?;
-    let bias = bname.map(|n| load_tensor(w, n, dev)).transpose()?;
-    Ok(Linear::new(weight, bias))
-}
-
-fn mk_layer_norm(w: &Weights, wname: &str, bname: &str, eps: f64, dev: &Device) -> Result<LayerNorm, EncoderError> {
-    let weight = load_tensor(w, wname, dev)?;
-    let bias = load_tensor(w, bname, dev)?;
-    Ok(LayerNorm::new(weight, bias, eps))
-}
-
-fn mk_conv2d(w: &Weights, wname: &str, bname: &str, stride: usize, padding: usize, dev: &Device) -> Result<Conv2d, EncoderError> {
-    let weight = load_tensor(w, wname, dev)?;
-    let bias = load_tensor(w, bname, dev)?;
-    let cfg = Conv2dConfig { stride, padding, ..Default::default() };
-    Ok(Conv2d::new(weight, Some(bias), cfg))
-}
-
 // --- forward-pass helpers ---
 
 // Sinusoidal PE [n_pos, d_model], per-chunk starting from position 0.
@@ -93,7 +57,7 @@ fn mk_conv2d(w: &Weights, wname: &str, bname: &str, stride: usize, padding: usiz
 //   1. log_timescale = log(10000) / (half - 1), not the usual 2i/d_model
 //   2. layout: sines in row[0..half], cosines in row[half..d_model] (not interleaved)
 // See qwen_sinusoidal_pe() in qwen_asr_kernels.c.
-fn sinusoidal_pe(n_pos: usize, d_model: usize, dev: &Device) -> Result<Tensor, EncoderError> {
+fn sinusoidal_pe(n_pos: usize, d_model: usize, dev: &Device) -> candle_core::Result<Tensor> {
     let half = d_model / 2;
     let log_timescale = 10000f32.ln() / (half - 1) as f32;
     let mut data = vec![0f32; n_pos * d_model];
@@ -109,7 +73,7 @@ fn sinusoidal_pe(n_pos: usize, d_model: usize, dev: &Device) -> Result<Tensor, E
 
 // Attention bias: 0.0 within each window, -inf across windows [total, total].
 // Windows are contiguous, non-overlapping, each of `window_size` tokens.
-fn window_mask(total: usize, window_size: usize, dev: &Device) -> Result<Tensor, EncoderError> {
+fn window_mask(total: usize, window_size: usize, dev: &Device) -> candle_core::Result<Tensor> {
     let mut data = vec![f32::NEG_INFINITY; total * total];
     let mut start = 0;
     while start < total {
@@ -133,7 +97,7 @@ impl EncLayer {
         mask: &Tensor,
         n_heads: usize,
         head_dim: usize,
-    ) -> Result<Tensor, EncoderError> {
+    ) -> candle_core::Result<Tensor> {
         let seq = x.dims()[0];
 
         // Self-attention (pre-norm)
@@ -174,41 +138,51 @@ impl EncLayer {
 // --- Encoder::load ---
 
 impl Encoder {
-    pub fn load(w: &Weights, cfg: EncoderConfig, dev: &Device) -> Result<Self, EncoderError> {
-        const P: &str = "thinker.audio_tower.";
+    // Weights loaded as F32. File stores BF16 (~356 MB for 0.6b encoder); F32 doubles
+    // that to ~712 MB. CPU candle has no BF16 matmul kernel, so F32 is required for now.
+    // SAFETY: the safetensors files must not be modified while the Encoder is live.
+    pub fn load(paths: &[impl AsRef<Path>], cfg: EncoderConfig, dev: &Device) -> candle_core::Result<Self> {
+        let paths: Vec<&Path> = paths.iter().map(|p| p.as_ref()).collect();
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::F32, dev)? };
+        let vb = vb.pp("thinker.audio_tower");
 
-        let conv1    = mk_conv2d(w, &format!("{P}conv2d1.weight"), &format!("{P}conv2d1.bias"), 2, 1, dev)?;
-        let conv2    = mk_conv2d(w, &format!("{P}conv2d2.weight"), &format!("{P}conv2d2.bias"), 2, 1, dev)?;
-        let conv3    = mk_conv2d(w, &format!("{P}conv2d3.weight"), &format!("{P}conv2d3.bias"), 2, 1, dev)?;
-        let conv_out = mk_linear(w, &format!("{P}conv_out.weight"), None, dev)?;
+        // Conv stem constants (QWEN_CONV_HIDDEN=480, fixed for both model sizes):
+        // three stride-2 convolutions reduce height 128→64→32→16, so c_h=16, flat=480*16=7680.
+        const CONV_CH: usize = 480;
+        const CONV_FLAT: usize = 480 * 16;
+        let conv_cfg = Conv2dConfig { stride: 2, padding: 1, ..Default::default() };
+        let conv1   = conv2d(1,       CONV_CH, 3, conv_cfg, vb.pp("conv2d1"))?;
+        let conv2   = conv2d(CONV_CH, CONV_CH, 3, conv_cfg, vb.pp("conv2d2"))?;
+        let conv3   = conv2d(CONV_CH, CONV_CH, 3, conv_cfg, vb.pp("conv2d3"))?;
+        let conv_out = linear_no_bias(CONV_FLAT, cfg.d_model, vb.pp("conv_out"))?;
 
         let mut layers = Vec::with_capacity(cfg.layers);
         for i in 0..cfg.layers {
-            let lp = format!("{P}layers.{i}");
+            let lp = vb.pp(format!("layers.{i}"));
             layers.push(EncLayer {
-                q_proj:    mk_linear(w, &format!("{lp}.self_attn.q_proj.weight"),   Some(&format!("{lp}.self_attn.q_proj.bias")),   dev)?,
-                k_proj:    mk_linear(w, &format!("{lp}.self_attn.k_proj.weight"),   Some(&format!("{lp}.self_attn.k_proj.bias")),   dev)?,
-                v_proj:    mk_linear(w, &format!("{lp}.self_attn.v_proj.weight"),   Some(&format!("{lp}.self_attn.v_proj.bias")),   dev)?,
-                o_proj:    mk_linear(w, &format!("{lp}.self_attn.out_proj.weight"), Some(&format!("{lp}.self_attn.out_proj.bias")), dev)?,
-                attn_norm: mk_layer_norm(w, &format!("{lp}.self_attn_layer_norm.weight"), &format!("{lp}.self_attn_layer_norm.bias"), 1e-5, dev)?,
+                q_proj:    linear(cfg.d_model, cfg.d_model, lp.pp("self_attn.q_proj"))?,
+                k_proj:    linear(cfg.d_model, cfg.d_model, lp.pp("self_attn.k_proj"))?,
+                v_proj:    linear(cfg.d_model, cfg.d_model, lp.pp("self_attn.v_proj"))?,
+                o_proj:    linear(cfg.d_model, cfg.d_model, lp.pp("self_attn.out_proj"))?,
+                attn_norm: layer_norm(cfg.d_model, 1e-5, lp.pp("self_attn_layer_norm"))?,
                 mlp: Mlp {
-                    fc1: mk_linear(w, &format!("{lp}.fc1.weight"), Some(&format!("{lp}.fc1.bias")), dev)?,
-                    fc2: mk_linear(w, &format!("{lp}.fc2.weight"), Some(&format!("{lp}.fc2.bias")), dev)?,
+                    fc1: linear(cfg.d_model, cfg.ffn_dim, lp.pp("fc1"))?,
+                    fc2: linear(cfg.ffn_dim, cfg.d_model, lp.pp("fc2"))?,
                 },
-                ffn_norm: mk_layer_norm(w, &format!("{lp}.final_layer_norm.weight"), &format!("{lp}.final_layer_norm.bias"), 1e-5, dev)?,
+                ffn_norm: layer_norm(cfg.d_model, 1e-5, lp.pp("final_layer_norm"))?,
             });
         }
 
-        let ln_post = mk_layer_norm(w, &format!("{P}ln_post.weight"), &format!("{P}ln_post.bias"), 1e-5, dev)?;
-        let proj1   = mk_linear(w, &format!("{P}proj1.weight"), Some(&format!("{P}proj1.bias")), dev)?;
-        let proj2   = mk_linear(w, &format!("{P}proj2.weight"), Some(&format!("{P}proj2.bias")), dev)?;
+        let ln_post = layer_norm(cfg.d_model, 1e-5, vb.pp("ln_post"))?;
+        let proj1   = linear(cfg.d_model, cfg.d_model,    vb.pp("proj1"))?;
+        let proj2   = linear(cfg.d_model, cfg.output_dim, vb.pp("proj2"))?;
 
         Ok(Encoder { conv1, conv2, conv3, conv_out, layers, ln_post, proj1, proj2, cfg })
     }
 
     // Input mel: [128, mel_frames] (128 mel bins, F32)
     // Output:    [total_tokens, output_dim]
-    pub fn forward(&self, mel: &Tensor) -> Result<Tensor, EncoderError> {
+    pub fn forward(&self, mel: &Tensor) -> candle_core::Result<Tensor> {
         let dev = mel.device();
         let mel_frames = mel.dims()[1];
         let chunk_size = self.cfg.chunk_size;
@@ -307,11 +281,10 @@ impl std::fmt::Display for Encoder {
 mod tests {
     use super::*;
     use crate::preset::ModelPreset;
-    use crate::weights::Weights;
     use std::env;
     use std::path::PathBuf;
 
-    fn smoke_model_path() -> PathBuf {
+    fn smoke_shard_path() -> PathBuf {
         if let Ok(model_dir) = env::var("QWEN_ASR_MODEL_DIR") {
             let p = PathBuf::from(model_dir);
             return if p.is_dir() { p.join("model.safetensors") } else { p };
@@ -328,11 +301,9 @@ or QWEN_ASR_ROOT=/abs/path/to/repo-root"
     #[test]
     #[ignore]
     fn load_0_6b_encoder_smoke() {
-        let shard = smoke_model_path();
-        let weights = Weights::from_files(&[&shard]).expect("failed to load weights");
-
-        let cfg = ModelPreset::from(&weights).config().encoder;
-        let enc = Encoder::load(&weights, cfg.clone(), &Device::Cpu).expect("Encoder::load failed");
+        let shard = smoke_shard_path();
+        let cfg = ModelPreset::Qwen3Asr0_6b.config().encoder;
+        let enc = Encoder::load(&[&shard], cfg.clone(), &Device::Cpu).expect("Encoder::load failed");
         assert_eq!(enc.cfg, cfg);
         println!("{}", enc);
     }
@@ -361,10 +332,9 @@ or QWEN_ASR_ROOT=/abs/path/to/repo-root"
             .collect();
         let mel = Tensor::from_vec(floats, (128, mel_frames), &Device::Cpu).unwrap();
 
-        let shard = smoke_model_path();
-        let weights = Weights::from_files(&[&shard]).expect("failed to load weights");
-        let cfg = ModelPreset::from(&weights).config().encoder;
-        let enc = Encoder::load(&weights, cfg, &Device::Cpu).expect("Encoder::load failed");
+        let shard = smoke_shard_path();
+        let cfg = ModelPreset::Qwen3Asr0_6b.config().encoder;
+        let enc = Encoder::load(&[&shard], cfg, &Device::Cpu).expect("Encoder::load failed");
 
         let out = enc.forward(&mel).expect("forward failed");
         let out_vec = out.to_vec2::<f32>().unwrap();
@@ -384,10 +354,9 @@ or QWEN_ASR_ROOT=/abs/path/to/repo-root"
     #[test]
     #[ignore]
     fn forward_0_6b_shape() {
-        let shard = smoke_model_path();
-        let weights = Weights::from_files(&[&shard]).expect("failed to load weights");
-        let cfg = ModelPreset::from(&weights).config().encoder;
-        let enc = Encoder::load(&weights, cfg.clone(), &Device::Cpu).expect("Encoder::load failed");
+        let shard = smoke_shard_path();
+        let cfg = ModelPreset::Qwen3Asr0_6b.config().encoder;
+        let enc = Encoder::load(&[&shard], cfg.clone(), &Device::Cpu).expect("Encoder::load failed");
 
         // One full chunk of silence
         let mel = Tensor::zeros((128, cfg.chunk_size), DType::F32, &Device::Cpu).unwrap();

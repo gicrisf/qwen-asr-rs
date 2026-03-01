@@ -4,8 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-safetensors = "0.7.0"
-half = "2.4.1"
 thiserror = "2.0.18"
 serde_json = "1.0.149"
 candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
