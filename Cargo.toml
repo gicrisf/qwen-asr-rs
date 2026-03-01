@@ -13,3 +13,4 @@ candle-transformers = { git = "https://github.com/huggingface/candle.git", versi
 hound = "3"
 rubato = "0.16"
 rustfft = "6"
+clap = { version = "4", features = ["derive"] }

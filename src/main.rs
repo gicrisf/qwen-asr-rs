@@ -8,22 +8,41 @@ mod transcribe;
 
 use std::path::PathBuf;
 
+use clap::Parser;
+
+/// Qwen3-ASR speech-to-text inference (Rust port)
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    /// Model directory (contains vocab.json, merges.txt, model.safetensors[.index.json])
+    #[arg(short = 'd', long)]
+    model_dir: PathBuf,
+
+    /// Input WAV file
+    #[arg(short = 'i', long)]
+    input: PathBuf,
+
+    /// Suppress progress output on stderr (transcription still printed to stdout)
+    #[arg(long)]
+    silent: bool,
+}
+
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 3 {
-        eprintln!("Usage: {} <model_dir> <wav_file>", args[0]);
-        std::process::exit(1);
+    let args = Args::parse();
+
+    if !args.silent {
+        eprintln!("Loading model from {} ...", args.model_dir.display());
     }
-    let model_dir = PathBuf::from(&args[1]);
-    let wav_path  = PathBuf::from(&args[2]);
 
-    eprintln!("Loading model from {}...", model_dir.display());
-    let mut pipeline = transcribe::Pipeline::load(&model_dir)
-        .expect("failed to load model");
+    let mut pipeline = transcribe::Pipeline::load(&args.model_dir)
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
 
-    eprintln!("Transcribing {}...", wav_path.display());
-    let text = pipeline.transcribe(&wav_path)
-        .expect("transcription failed");
+    if !args.silent {
+        eprintln!("Transcribing {} ...", args.input.display());
+    }
+
+    let text = pipeline.transcribe(&args.input)
+        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
 
     println!("{text}");
 }
