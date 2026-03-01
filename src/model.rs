@@ -1,7 +1,7 @@
 use crate::audio::AudioConfig;
-use crate::decoder::DecoderConfig;
 use crate::encoder::EncoderConfig;
 use crate::preset::ModelPreset;
+use candle_transformers::models::qwen3::Config as Qwen3Config;
 
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -22,7 +22,7 @@ enum ModelError {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub encoder: EncoderConfig,
-    pub decoder: DecoderConfig,
+    pub decoder: Qwen3Config,
     // TODO
     // pub tokenizer: TokenizerConfig,
     pub audio: AudioConfig,

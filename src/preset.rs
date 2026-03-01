@@ -1,8 +1,8 @@
 use crate::audio::AudioConfig;
-use crate::decoder::DecoderConfig;
 use crate::encoder::EncoderConfig;
 use crate::model::ModelConfig;
 use crate::weights::Weights;
+use candle_transformers::models::qwen3::Config as Qwen3Config;
 
 use std::convert::From;
 
@@ -49,30 +49,28 @@ impl ModelPreset {
         }
     }
 
-    fn decoder_config(&self) -> DecoderConfig {
-        match self {
-            ModelPreset::Qwen3Asr0_6b => DecoderConfig {
-                vocab_size: 151936,
-                hidden_size: 1024,
-                intermediate_size: 3072,
-                num_layers: 28,
-                num_attention_heads: 16,
-                num_key_value_heads: 8,
-                head_dim: 128,
-                rope_theta: 1e6,
-                rms_norm_eps: 1e-6,
-            },
-            ModelPreset::Qwen3Asr1_7b => DecoderConfig {
-                vocab_size: 151936,
-                hidden_size: 2048,
-                intermediate_size: 6144,
-                num_layers: 28,
-                num_attention_heads: 16,
-                num_key_value_heads: 8,
-                head_dim: 128,
-                rope_theta: 1e6,
-                rms_norm_eps: 1e-6,
-            },
+    fn decoder_config(&self) -> Qwen3Config {
+        let (hidden_size, intermediate_size, num_hidden_layers) = match self {
+            ModelPreset::Qwen3Asr0_6b => (1024, 3072, 28),
+            ModelPreset::Qwen3Asr1_7b => (2048, 6144, 28),
+        };
+        Qwen3Config {
+            vocab_size: 151936,
+            hidden_size,
+            intermediate_size,
+            num_hidden_layers,
+            num_attention_heads: 16,
+            num_key_value_heads: 8,
+            head_dim: 128,
+            attention_bias: false,
+            max_position_embeddings: 65536,
+            sliding_window: None,
+            max_window_layers: num_hidden_layers,
+            tie_word_embeddings: true,
+            rope_theta: 1e6,
+            rms_norm_eps: 1e-6,
+            use_sliding_window: false,
+            hidden_act: candle_nn::Activation::Silu,
         }
     }
 
