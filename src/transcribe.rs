@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use candle_core::{Device, Tensor};
+use candle_core::{DType, Device, Tensor};
 use thiserror::Error;
 
 use crate::audio::{self, AudioConfig, AudioError};
@@ -29,11 +30,19 @@ pub enum TranscribeError {
     MissingWeights(String),
 }
 
+/// Per-run timing breakdown returned by [`Pipeline::transcribe_timed`].
+pub struct TimingInfo {
+    pub encode_ms: f64,
+    pub decode_ms: f64,
+    pub n_tokens:  usize,
+    pub audio_ms:  f64,
+}
+
 pub struct Pipeline {
-    encoder:   Encoder,
-    decoder:   Decoder,
-    tokenizer: Tokenizer,
-    audio_cfg: AudioConfig,
+    pub encoder:   Encoder,
+    pub decoder:   Decoder,
+    pub tokenizer: Tokenizer,
+    pub audio_cfg: AudioConfig,
 }
 
 impl Pipeline {
@@ -52,32 +61,41 @@ impl Pipeline {
 
     /// Transcribe a WAV file to text.
     pub fn transcribe(&mut self, wav_path: &Path) -> Result<String, TranscribeError> {
+        let (mel, _) = self.mel_from_wav(wav_path)?;
+        let (text, _) = self.transcribe_mel(&mel, 0.0)?;
+        Ok(text)
+    }
+
+    /// Transcribe a WAV file and return per-phase timing.
+    pub fn transcribe_timed(&mut self, wav_path: &Path) -> Result<(String, TimingInfo), TranscribeError> {
+        let (mel, audio_ms) = self.mel_from_wav(wav_path)?;
+        self.transcribe_mel(&mel, audio_ms)
+    }
+
+    /// Run the full pipeline on a pre-built mel tensor.
+    /// Used internally and by the bench tool so audio loading isn't re-timed.
+    pub fn transcribe_mel(&mut self, mel: &Tensor, audio_ms: f64) -> Result<(String, TimingInfo), TranscribeError> {
         let dev = Device::Cpu;
 
-        // 1. Audio → log-mel spectrogram [mel_bins, n_frames]
-        let samples = audio::load_wav(wav_path, &self.audio_cfg)?;
-        let (mel_flat, n_frames) = audio::mel_spectrogram(&samples, &self.audio_cfg);
-        if n_frames == 0 {
-            return Ok(String::new());
-        }
-        let mel = Tensor::from_vec(mel_flat, (self.audio_cfg.mel_bins, n_frames), &dev)?;
+        // ── Encoder ───────────────────────────────────────────────────────────
+        let t_enc   = Instant::now();
+        let enc_out = self.encoder.forward(mel)?;
+        let encode_ms = t_enc.elapsed().as_secs_f64() * 1000.0;
 
-        // 2. Encoder → [n_audio, output_dim]
-        let enc_out = self.encoder.forward(&mel)?;
         let (n_audio, _) = enc_out.dims2()?;
         eprintln!("encoder: {n_audio} audio tokens");
 
-        // 3. Build full prompt embeddings:
-        //    [PREFIX_HEAD | PREFIX_TAIL | audio×n | SUFFIX_BASE | <asr_text>]
+        // ── Build prompt embeddings ───────────────────────────────────────────
+        let t_dec = Instant::now();
+
         let prefix_ids: Vec<u32> = PROMPT_PREFIX_HEAD.iter()
             .chain(PROMPT_PREFIX_TAIL.iter())
             .copied()
             .collect();
         let prefix_len = prefix_ids.len();
         let prefix_t   = Tensor::from_vec(prefix_ids, (1, prefix_len), &dev)?;
-        let prefix_emb = self.decoder.embed(&prefix_t)?; // [1, prefix_len, hidden]
+        let prefix_emb = self.decoder.embed(&prefix_t)?;
 
-        // Encoder output as embeddings: [n_audio, hidden] → [1, n_audio, hidden]
         let audio_emb = enc_out.unsqueeze(0)?;
 
         let suffix_ids: Vec<u32> = PROMPT_SUFFIX_BASE.iter()
@@ -86,17 +104,17 @@ impl Pipeline {
             .collect();
         let suffix_len = suffix_ids.len();
         let suffix_t   = Tensor::from_vec(suffix_ids, (1, suffix_len), &dev)?;
-        let suffix_emb = self.decoder.embed(&suffix_t)?; // [1, suffix_len, hidden]
+        let suffix_emb = self.decoder.embed(&suffix_t)?;
 
         let prompt_emb = Tensor::cat(&[&prefix_emb, &audio_emb, &suffix_emb], 1)?;
         let prompt_len = prompt_emb.dims()[1];
 
-        // 4. Prefill: run all prompt tokens through the decoder at once.
+        // ── Prefill ───────────────────────────────────────────────────────────
         self.decoder.clear_kv_cache();
-        let logits    = self.decoder.forward_with_embeds(&prompt_emb, 0)?; // [1, vocab]
+        let logits    = self.decoder.forward_with_embeds(&prompt_emb, 0)?;
         let mut token = logits.squeeze(0)?.argmax(0)?.to_scalar::<u32>()?;
 
-        // 5. Autoregressive loop: collect tokens until <|im_end|> or budget.
+        // ── Autoregressive loop ───────────────────────────────────────────────
         let max_new_tokens = 448;
         let mut output_ids: Vec<u32> = Vec::new();
         let mut offset = prompt_len;
@@ -110,14 +128,40 @@ impl Pipeline {
             offset += 1;
         }
 
-        // 6. Decode token IDs → UTF-8 text.
-        Ok(self.tokenizer.decode(&output_ids, true)?)
+        let decode_ms = t_dec.elapsed().as_secs_f64() * 1000.0;
+        let n_tokens  = output_ids.len();
+
+        let text = self.tokenizer.decode(&output_ids, true)?;
+        Ok((text, TimingInfo { encode_ms, decode_ms, n_tokens, audio_ms }))
+    }
+
+    /// Run only the encoder on a mel tensor and return (n_audio_tokens, encode_ms).
+    pub fn encode_timed(&mut self, mel: &Tensor) -> Result<(usize, f64), TranscribeError> {
+        let t = Instant::now();
+        let out = self.encoder.forward(mel)?;
+        let ms  = t.elapsed().as_secs_f64() * 1000.0;
+        Ok((out.dims()[0], ms))
+    }
+
+    /// Load a WAV file and return (mel tensor [mel_bins, n_frames], audio_duration_ms).
+    pub fn mel_from_wav(&self, wav_path: &Path) -> Result<(Tensor, f64), TranscribeError> {
+        let samples  = audio::load_wav(wav_path, &self.audio_cfg)?;
+        let audio_ms = samples.len() as f64 / self.audio_cfg.sample_rate as f64 * 1000.0;
+        let (flat, n_frames) = audio::mel_spectrogram(&samples, &self.audio_cfg);
+        let mel = Tensor::from_vec(flat, (self.audio_cfg.mel_bins, n_frames), &Device::Cpu)?;
+        Ok((mel, audio_ms))
+    }
+
+    /// Build a zeroed (silence) mel tensor for `audio_sec` seconds.
+    pub fn mel_silence(&self, audio_sec: u32) -> Result<(Tensor, f64), TranscribeError> {
+        let n_frames = (audio_sec as usize * self.audio_cfg.sample_rate as usize)
+            / self.audio_cfg.hop_length;
+        let mel = Tensor::zeros((self.audio_cfg.mel_bins, n_frames), DType::F32, &Device::Cpu)?;
+        Ok((mel, audio_sec as f64 * 1000.0))
     }
 }
 
 /// Collect weight shard paths from a model directory.
-/// 0.6b: single `model.safetensors`.
-/// 1.7b: shards listed in `model.safetensors.index.json`.
 pub fn collect_shards(model_dir: &Path) -> Result<Vec<PathBuf>, TranscribeError> {
     let index = model_dir.join("model.safetensors.index.json");
     if index.exists() {

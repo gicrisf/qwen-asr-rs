@@ -47,7 +47,7 @@ pub struct Encoder {
     ln_post: LayerNorm,
     proj1: Linear,
     proj2: Linear,
-    cfg: EncoderConfig,
+    pub cfg: EncoderConfig,
 }
 
 // --- forward-pass helpers ---

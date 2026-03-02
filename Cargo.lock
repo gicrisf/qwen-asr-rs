@@ -945,6 +945,8 @@ dependencies = [
  "candle-transformers",
  "clap",
  "hound",
+ "num_cpus",
+ "rayon",
  "rubato",
  "rustfft",
  "serde_json",
