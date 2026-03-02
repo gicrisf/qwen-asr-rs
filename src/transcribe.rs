@@ -152,6 +152,15 @@ impl Pipeline {
         Ok((mel, audio_ms))
     }
 
+    /// Load WAV audio from a byte buffer and return (mel tensor, audio_duration_ms).
+    pub fn mel_from_bytes(&self, bytes: &[u8]) -> Result<(Tensor, f64), TranscribeError> {
+        let samples  = audio::load_wav_from_bytes(bytes, &self.audio_cfg)?;
+        let audio_ms = samples.len() as f64 / self.audio_cfg.sample_rate as f64 * 1000.0;
+        let (flat, n_frames) = audio::mel_spectrogram(&samples, &self.audio_cfg);
+        let mel = Tensor::from_vec(flat, (self.audio_cfg.mel_bins, n_frames), &Device::Cpu)?;
+        Ok((mel, audio_ms))
+    }
+
     /// Build a zeroed (silence) mel tensor for `audio_sec` seconds.
     pub fn mel_silence(&self, audio_sec: u32) -> Result<(Tensor, f64), TranscribeError> {
         let n_frames = (audio_sec as usize * self.audio_cfg.sample_rate as usize)

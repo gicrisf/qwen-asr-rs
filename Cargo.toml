@@ -16,3 +16,6 @@ rustfft = "6"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
 num_cpus = "1"
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }

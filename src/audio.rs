@@ -47,6 +47,20 @@ impl Default for AudioConfig {
 /// Load a WAV file, downmix to mono, normalize to f32 [-1,1], resample to target rate.
 pub fn load_wav(path: &Path, cfg: &AudioConfig) -> Result<Vec<f32>, AudioError> {
     let reader = hound::WavReader::open(path)?;
+    wav_reader_into_samples(reader, cfg)
+}
+
+/// Load WAV audio from a byte buffer.  Same processing as [`load_wav`].
+pub fn load_wav_from_bytes(bytes: &[u8], cfg: &AudioConfig) -> Result<Vec<f32>, AudioError> {
+    let cursor = std::io::Cursor::new(bytes);
+    let reader = hound::WavReader::new(cursor)?;
+    wav_reader_into_samples(reader, cfg)
+}
+
+fn wav_reader_into_samples<R: std::io::Read>(
+    reader: hound::WavReader<R>,
+    cfg: &AudioConfig,
+) -> Result<Vec<f32>, AudioError> {
     let spec = reader.spec();
     let channels = spec.channels as usize;
 
