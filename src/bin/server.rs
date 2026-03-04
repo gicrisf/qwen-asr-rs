@@ -50,6 +50,10 @@ struct Args {
     /// Default forced language (empty = auto-detect)
     #[arg(long, default_value = "")]
     language: String,
+
+    /// Directory for static files (serves index.html at GET /)
+    #[arg(long)]
+    public: Option<PathBuf>,
 }
 
 // ── Shared state ──────────────────────────────────────────────────────────────
@@ -59,6 +63,8 @@ struct ServerState {
     model_dir: PathBuf,
     /// Server-level default language (empty = auto-detect).
     language: String,
+    /// Contents of public/index.html, if --public was given and the file exists.
+    index_html: Option<String>,
 }
 
 type Shared = Arc<Mutex<ServerState>>;
@@ -87,8 +93,14 @@ fn json_ok(v: serde_json::Value) -> Response {
 
 // ── Handlers ──────────────────────────────────────────────────────────────────
 
-async fn get_root() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+/// Embedded at compile time from `public/index.html`.
+/// Served by default; `--public` overrides it at runtime.
+const PUBLIC_INDEX_HTML: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/public/index.html"));
+
+/// Minimal built-in page, used only if `public/index.html` is removed from the project.
+#[allow(dead_code)]
+const BUILTIN_HTML: &str = r#"<!DOCTYPE html>
 <html>
 <head>
   <title>Qwen3-ASR Server</title>
@@ -123,7 +135,13 @@ async fn get_root() -> Html<&'static str> {
   <button type="submit">Transcribe</button>
 </form>
 </body>
-</html>"#)
+</html>"#;
+
+async fn get_root(State(shared): State<Shared>) -> Response {
+    let st = shared.lock().unwrap();
+    // Priority: --public runtime file → compiled-in public/index.html → BUILTIN_HTML
+    let html: &str = st.index_html.as_deref().unwrap_or(PUBLIC_INDEX_HTML);
+    Html(html.to_owned()).into_response()
 }
 
 async fn get_health(State(shared): State<Shared>) -> Response {
@@ -287,10 +305,18 @@ async fn main() {
     let pipeline = Pipeline::load(&args.model_dir)
         .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
 
+    let index_html = args.public.as_deref().map(|p| p.join("index.html")).and_then(|p| {
+        match std::fs::read_to_string(&p) {
+            Ok(s)  => { eprintln!("Serving {} at GET /", p.display()); Some(s) }
+            Err(e) => { eprintln!("warning: could not read {}: {e}", p.display()); None }
+        }
+    });
+
     let shared: Shared = Arc::new(Mutex::new(ServerState {
         pipeline: Some(pipeline),
         model_dir: args.model_dir,
         language: args.language,
+        index_html,
     }));
 
     let app = Router::new()
