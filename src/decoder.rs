@@ -39,10 +39,12 @@ impl RopeCache {
         let (_, _, seq, _) = q.dims4()?;
         let cos = self.cos.narrow(0, offset, seq)?.contiguous()?;
         let sin = self.sin.narrow(0, offset, seq)?.contiguous()?;
-        Ok((
-            rope(&q.contiguous()?, &cos, &sin)?,
-            rope(&k.contiguous()?, &cos, &sin)?,
-        ))
+        let dtype = q.dtype();
+        let q = rope(&q.to_dtype(DType::F32)?.contiguous()?, &cos, &sin)?
+            .to_dtype(dtype)?;
+        let k = rope(&k.to_dtype(DType::F32)?.contiguous()?, &cos, &sin)?
+            .to_dtype(dtype)?;
+        Ok((q, k))
     }
 }
 
@@ -144,7 +146,7 @@ impl DecAttn {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = mask {
-            scores = scores.broadcast_add(m)?;
+            scores = scores.broadcast_add(&m.to_dtype(scores.dtype())?)?;
         }
         let probs = softmax_last_dim(&scores)?;
 
@@ -201,10 +203,11 @@ impl DecLayer {
     }
 
     fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        let dtype = x.dtype();
         let h = self.ln1.forward(x)?;
-        let h = self.attn.forward(&h, mask, offset)?;
+        let h = self.attn.forward(&h, mask, offset)?.to_dtype(dtype)?;
         let x = (x + h)?;
-        let h2 = self.mlp.forward(&self.ln2.forward(&x)?)?;
+        let h2 = self.mlp.forward(&self.ln2.forward(&x)?)?.to_dtype(dtype)?;
         x + h2
     }
 
@@ -224,7 +227,7 @@ pub struct Decoder {
 impl Decoder {
     pub fn load(paths: &[impl AsRef<Path>], cfg: &Qwen3Config, dev: &Device) -> Result<Self> {
         let paths: Vec<&Path> = paths.iter().map(|p| p.as_ref()).collect();
-        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::F32, dev)? };
+        let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths, DType::BF16, dev)? };
         let vb = vb.pp("thinker");
 
         let rope = Arc::new(RopeCache::new(cfg, dev)?);

@@ -96,7 +96,7 @@ impl Pipeline {
         let prefix_t   = Tensor::from_vec(prefix_ids, (1, prefix_len), &dev)?;
         let prefix_emb = self.decoder.embed(&prefix_t)?;
 
-        let audio_emb = enc_out.unsqueeze(0)?;
+        let audio_emb = enc_out.unsqueeze(0)?.to_dtype(DType::BF16)?;
 
         let suffix_ids: Vec<u32> = PROMPT_SUFFIX_BASE.iter()
             .copied()

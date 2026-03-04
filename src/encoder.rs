@@ -138,8 +138,8 @@ impl EncLayer {
 // --- Encoder::load ---
 
 impl Encoder {
-    // Weights loaded as F32. File stores BF16 (~356 MB for 0.6b encoder); F32 doubles
-    // that to ~712 MB. CPU candle has no BF16 matmul kernel, so F32 is required for now.
+    // Encoder weights loaded as F32: the mel input is F32, and Conv2D requires matching
+    // dtypes. The decoder uses BF16 weights where the large linear layers benefit most.
     // SAFETY: the safetensors files must not be modified while the Encoder is live.
     pub fn load(paths: &[impl AsRef<Path>], cfg: EncoderConfig, dev: &Device) -> candle_core::Result<Self> {
         let paths: Vec<&Path> = paths.iter().map(|p| p.as_ref()).collect();

@@ -7,9 +7,9 @@ edition = "2024"
 thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false }
 serde_json = "1.0.149"
-candle-core = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
-candle-nn = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
-candle-transformers = { git = "https://github.com/huggingface/candle.git", version = "0.9.2" }
+candle-core = { git = "https://github.com/gicrisf/candle", branch = "bf16-gemm" }
+candle-nn = { git = "https://github.com/gicrisf/candle", branch = "bf16-gemm" }
+candle-transformers = { git = "https://github.com/gicrisf/candle", branch = "bf16-gemm" }
 hound = "3"
 rubato = "0.16"
 rustfft = "6"
@@ -19,3 +19,8 @@ num_cpus = "1"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
+
+[patch.crates-io]
+gemm = { git = "https://github.com/gicrisf/gemm", branch = "bf16" }
+gemm-common = { git = "https://github.com/gicrisf/gemm", branch = "bf16" }
+gemm-f32 = { git = "https://github.com/gicrisf/gemm", branch = "bf16" }
