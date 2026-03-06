@@ -122,14 +122,27 @@ The **encoder** runs a Conv2D stem (three stride-2 layers) followed by a windowe
 
 ## Performance
 
-Benchmarked on a 12-thread CPU with `Qwen3-ASR-0.6B`, JFK sample (~11 s audio), 4 threads:
+Benchmarked on AMD Ryzen 5 4600H (6c/12t laptop), `Qwen3-ASR-0.6B`, JFK sample (~11 s audio), all threads.
 
-|               | Encode | Decode | Total  | RT factor |
-|---------------|--------|--------|--------|-----------|
-| C (OpenBLAS)  | ~1.2 s | ~3.3 s | ~4.6 s | 0.42x     |
-| Rust (candle) | ~1.7 s | ~5.1 s | ~6.7 s | 0.61x     |
+**Cold-start — hyperfine (10 runs, 2 warmup):**
 
-The gap is due to candle's CPU matmul vs OpenBLAS. Enabling `mkl` in candle (Intel CPUs only) or switching to a BLAS-backed backend should close most of it.
+| Implementation     | Mean   | RT factor        |
+|--------------------|--------|------------------|
+| libtorch (tch-rs)  | 10.12s | —                |
+| candle (this repo) | 8.28s  | **1.22x faster** |
+
+The cold-start advantage comes mostly from faster model loading via mmap.
+
+**Warm inference — bench binary (10 runs, model loaded once):**
+
+| Implementation     | Mean   | RT factor |
+|--------------------|--------|-----------|
+| libtorch (tch-rs)  | 6018ms | 0.55x     |
+| candle (this repo) | 6444ms | 0.59x     |
+
+Warm inference is within ~7% of libtorch. Both beat real-time on this mid-range laptop.
+
+For a further ~28% speedup over libtorch at warm inference, see the [bf16-gemm branch](https://github.com/gicrisf/qwen-asr-rs) which uses a [custom candle fork](https://github.com/gicrisf/candle) with native BF16 matmul.
 
 ## Credits
 
