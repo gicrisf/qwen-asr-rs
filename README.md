@@ -146,5 +146,5 @@ For a further ~28% speedup over libtorch at warm inference, see the [bf16-gemm b
 
 ## Credits
 
-- [antirez](https://github.com/antirez) for his [C implementation](https://github.com/antirez/qwen-asr): a remarkably clean, zero-dependency inference engine.
+- [antirez](https://github.com/antirez) for his [C implementation](https://github.com/antirez/qwen-asr): a remarkably clean, almost zero-dependency inference engine.
 - [candle](https://github.com/huggingface/candle) by the Hugging Face team and its community, the framework that made this port practical.
