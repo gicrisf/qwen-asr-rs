@@ -142,7 +142,7 @@ The cold-start advantage comes mostly from faster model loading via mmap.
 
 Warm inference is within ~7% of libtorch. Both beat real-time on this mid-range laptop.
 
-For a further ~28% speedup over libtorch at warm inference, see the [bf16-gemm branch](https://github.com/gicrisf/qwen-asr-rs) which uses a [custom candle fork](https://github.com/gicrisf/candle) with native BF16 matmul.
+**For a further ~28% speedup** over libtorch at warm inference, see the [bf16-gemm branch](https://github.com/gicrisf/qwen-asr-rs/tree/bf16-gemm) which uses a [custom candle fork](https://github.com/gicrisf/candle) with mixed-precision BF16 GEMM ([upstream PR pending](https://github.com/sarah-quinones/gemm/pull/40)).
 
 ## Credits
 
