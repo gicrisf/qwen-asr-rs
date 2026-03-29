@@ -1,8 +1,10 @@
 # Qwen3 ASR
 
+> **Experimental branch**: This branch uses [mixed-precision BF16 GEMM](https://github.com/sarah-quinones/gemm/pull/40) via forked dependencies. Once the upstream PR is merged, these optimizations will be available in the main branch.
+
 Rust port of [antirez/qwen-asr](https://github.com/antirez/qwen-asr), a CPU inference engine for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR) speech-to-text models, built on [candle](https://github.com/huggingface/candle).
 
-The original C implementation by [antirez](https://github.com/antirez) is a zero-dependency inference engine that runs in real time even on modest hardware, with support for offline, segmented, and streaming transcription modes. This port follows the same architecture and uses it as the reference for correctness.
+The original C implementation by [antirez](https://github.com/antirez) is an almost-zero-dependency inference engine that runs in real time even on modest hardware, with support for offline, segmented, and streaming transcription modes. This port follows the same architecture and uses it as the reference for correctness.
 
 Supports:
 - `Qwen3-ASR-0.6B` (single shard, ~1.4 GB)
@@ -122,14 +124,19 @@ The **encoder** runs a Conv2D stem (three stride-2 layers) followed by a windowe
 
 ## Performance
 
-Benchmarked on a 12-thread CPU with `Qwen3-ASR-0.6B`, JFK sample (~11 s audio), 4 threads:
+Benchmarked on AMD Ryzen 5 4600H (6c/12t laptop), `Qwen3-ASR-0.6B`, JFK sample (~11 s audio).
 
-|               | Encode | Decode | Total  | RT factor |
-|---------------|--------|--------|--------|-----------|
-| C (OpenBLAS)  | ~1.2 s | ~3.3 s | ~4.6 s | 0.42x     |
-| Rust (candle) | ~1.7 s | ~5.1 s | ~6.7 s | 0.61x     |
+**Warm inference — bench binary (10 runs, model loaded once):**
 
-The gap is due to candle's CPU matmul vs OpenBLAS. Enabling `mkl` in candle (Intel CPUs only) or switching to a BLAS-backed backend should close most of it.
+| Implementation     | Mean    | RT factor | vs libtorch |
+|--------------------|---------|-----------|-------------|
+| libtorch (tch-rs)  | 6018 ms | 0.55x     | baseline    |
+| candle (main)      | 6444 ms | 0.59x     | 7% slower   |
+| candle (bf16-gemm) | 4698 ms | 0.43x     | **22% faster** |
+
+This branch uses forked crates with BF16 support:
+- [gemm fork](https://github.com/gicrisf/gemm/tree/bf16) ([upstream PR](https://github.com/sarah-quinones/gemm/pull/40))
+- [candle fork](https://github.com/gicrisf/candle)
 
 ## Credits
 
