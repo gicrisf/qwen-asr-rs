@@ -121,25 +121,34 @@ fn bench_encoder(pipeline: &mut Pipeline, n_runs: usize, args: &Args) {
               n_runs, n_frames, audio_ms / 1000.0, src_desc);
 
     // Warm-up
-    let _ = pipeline.encode_timed(&mel);
+    let _ = pipeline.encode_timed_breakdown(&mel);
 
     let mut elapsed_v = Vec::with_capacity(n_runs);
+    let mut conv_v = Vec::with_capacity(n_runs);
+    let mut xfmr_v = Vec::with_capacity(n_runs);
 
     for i in 0..n_runs {
-        let (seq_len, enc_ms) = pipeline.encode_timed(&mel)
+        let (seq_len, enc_ms, conv_ms, xfmr_ms) = pipeline.encode_timed_breakdown(&mel)
             .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
         elapsed_v.push(enc_ms);
-        eprintln!("  run {}/{n_runs}:  enc={:6.0} ms  seq_len={}", i + 1, enc_ms, seq_len);
+        conv_v.push(conv_ms);
+        xfmr_v.push(xfmr_ms);
+        eprintln!("  run {}/{n_runs}:  enc={:6.0} ms  conv={:6.0} ms  xfmr={:6.0} ms  seq_len={}",
+                  i + 1, enc_ms, conv_ms, xfmr_ms, seq_len);
     }
 
     let enc = stats(&elapsed_v);
+    let conv = stats(&conv_v);
+    let xfmr = stats(&xfmr_v);
     let n_layers = pipeline.encoder.cfg.layers;
 
     eprintln!();
     eprintln!("{:<14}  {:>8}  {:>8}  {:>8}", "",         "min",    "mean",   "max");
     eprintln!("{:<14}  {:>8.1}  {:>8.1}  {:>8.1}  ms",    "encode", enc.min, enc.mean, enc.max);
+    eprintln!("{:<14}  {:>8.1}  {:>8.1}  {:>8.1}  ms",    "conv_stem", conv.min, conv.mean, conv.max);
+    eprintln!("{:<14}  {:>8.1}  {:>8.1}  {:>8.1}  ms",    "transformer", xfmr.min, xfmr.mean, xfmr.max);
     eprintln!("{:<14}  {:>8.2}  {:>8.2}  {:>8.2}  ms/layer", "per layer",
-              enc.min / n_layers as f64, enc.mean / n_layers as f64, enc.max / n_layers as f64);
+              xfmr.min / n_layers as f64, xfmr.mean / n_layers as f64, xfmr.max / n_layers as f64);
     eprintln!();
 }
 

@@ -143,6 +143,14 @@ impl Pipeline {
         Ok((out.dims()[0], ms))
     }
 
+    /// Run only the encoder with detailed timing: (n_tokens, total_ms, conv_stem_ms, transformer_ms).
+    pub fn encode_timed_breakdown(&mut self, mel: &Tensor) -> Result<(usize, f64, f64, f64), TranscribeError> {
+        let t = Instant::now();
+        let (out, conv_ms, xfmr_ms) = self.encoder.forward_timed(mel)?;
+        let total_ms = t.elapsed().as_secs_f64() * 1000.0;
+        Ok((out.dims()[0], total_ms, conv_ms, xfmr_ms))
+    }
+
     /// Load a WAV file and return (mel tensor [mel_bins, n_frames], audio_duration_ms).
     pub fn mel_from_wav(&self, wav_path: &Path) -> Result<(Tensor, f64), TranscribeError> {
         let samples  = audio::load_wav(wav_path, &self.audio_cfg)?;

@@ -3,10 +3,133 @@ use std::path::Path;
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{
-    conv2d, layer_norm, linear, linear_no_bias,
+    layer_norm, linear, linear_no_bias,
     ops::softmax_last_dim,
-    Conv2d, Conv2dConfig, LayerNorm, Linear, Module, VarBuilder,
+    LayerNorm, Linear, Module, VarBuilder,
 };
+use rayon::prelude::*;
+
+// --- Custom im2col + GEMM conv2d (bypass candle for perf) ---
+
+/// im2col: Transform input [c_in, h_in, w_in] -> column matrix [patch_size, spatial_out]
+/// Direct port from qwen_asr_kernels.c:566-590
+fn im2col(
+    input: &[f32],
+    c_in: usize, h_in: usize, w_in: usize,
+    kh: usize, kw: usize,
+    stride: usize, padding: usize,
+    h_out: usize, w_out: usize,
+) -> Vec<f32> {
+    let col_len = h_out * w_out;
+    let patch_size = c_in * kh * kw;
+    let mut cols = vec![0.0f32; patch_size * col_len];
+
+    for ic in 0..c_in {
+        for ki in 0..kh {
+            for kj in 0..kw {
+                let col_row = (ic * kh + ki) * kw + kj;
+                let col_ptr = col_row * col_len;
+                for oh in 0..h_out {
+                    let ih = (oh * stride + ki) as isize - padding as isize;
+                    for ow in 0..w_out {
+                        let iw = (ow * stride + kj) as isize - padding as isize;
+                        if ih >= 0 && ih < h_in as isize && iw >= 0 && iw < w_in as isize {
+                            let in_idx = ic * h_in * w_in + ih as usize * w_in + iw as usize;
+                            cols[col_ptr + oh * w_out + ow] = input[in_idx];
+                        }
+                        // else: already 0 (padding)
+                    }
+                }
+            }
+        }
+    }
+    cols
+}
+
+/// Conv2d using im2col + gemm. Returns output [c_out, h_out, w_out] flattened.
+fn conv2d_gemm(
+    input: &[f32],
+    weight: &[f32],  // [c_out, patch_size] row-major
+    bias: &[f32],    // [c_out]
+    c_in: usize, c_out: usize,
+    h_in: usize, w_in: usize,
+    kh: usize, kw: usize,
+    stride: usize, padding: usize,
+) -> (Vec<f32>, usize, usize) {
+    let h_out = (h_in + 2 * padding - kh) / stride + 1;
+    let w_out = (w_in + 2 * padding - kw) / stride + 1;
+    let patch_size = c_in * kh * kw;
+    let spatial_out = h_out * w_out;
+
+    // im2col: input -> cols [patch_size, spatial_out]
+    let cols = im2col(input, c_in, h_in, w_in, kh, kw, stride, padding, h_out, w_out);
+
+    // GEMM: weight[c_out, patch_size] @ cols[patch_size, spatial_out] = out[c_out, spatial_out]
+    let mut output = vec![0.0f32; c_out * spatial_out];
+
+    // gemm expects: dst_cs, dst_rs (column stride, then row stride)
+    // For row-major matrices:
+    //   weight: [c_out, patch_size] -> cs=1, rs=patch_size
+    //   cols:   [patch_size, spatial_out] -> cs=1, rs=spatial_out
+    //   output: [c_out, spatial_out] -> cs=1, rs=spatial_out
+    unsafe {
+        gemm::gemm(
+            c_out,                   // m (rows of A and C)
+            spatial_out,             // n (cols of B and C)
+            patch_size,              // k (cols of A, rows of B)
+            output.as_mut_ptr(),
+            1,                       // dst_cs (column stride)
+            spatial_out as isize,    // dst_rs (row stride)
+            false,                   // read_dst
+            weight.as_ptr(),
+            1,                       // lhs_cs
+            patch_size as isize,     // lhs_rs
+            cols.as_ptr(),
+            1,                       // rhs_cs
+            spatial_out as isize,    // rhs_rs
+            0.0,                     // alpha (C = alpha*C + beta*A*B, don't read dst)
+            1.0,                     // beta
+            false, false, false,     // conj_dst, conj_lhs, conj_rhs
+            gemm::Parallelism::None, // Single-threaded (chunks parallelized via rayon)
+        );
+    }
+
+    // Add bias (broadcast across spatial dims)
+    for oc in 0..c_out {
+        let b = bias[oc];
+        let row_start = oc * spatial_out;
+        for s in 0..spatial_out {
+            output[row_start + s] += b;
+        }
+    }
+
+    (output, h_out, w_out)
+}
+
+/// GELU activation in-place (exact formula matching candle/C)
+fn gelu_inplace(x: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.7978845608028654;
+    const COEFF: f32 = 0.044715;
+
+    for v in x.iter_mut() {
+        let x3 = *v * *v * *v;
+        let inner = SQRT_2_OVER_PI * (*v + COEFF * x3);
+        *v = 0.5 * *v * (1.0 + inner.tanh());
+    }
+}
+
+/// Raw conv stem weights for direct GEMM
+struct ConvStem {
+    // Conv1: [1, 128, W] -> [480, 64, W1], kernel 3x3, stride 2, pad 1
+    conv1_weight: Vec<f32>,  // [480, 1*3*3] = [480, 9]
+    conv1_bias: Vec<f32>,    // [480]
+    // Conv2: [480, H1, W1] -> [480, H2, W2]
+    conv2_weight: Vec<f32>,  // [480, 480*3*3] = [480, 4320]
+    conv2_bias: Vec<f32>,    // [480]
+    // Conv3: [480, H2, W2] -> [480, H3, W3]
+    conv3_weight: Vec<f32>,  // [480, 480*3*3] = [480, 4320]
+    conv3_bias: Vec<f32>,    // [480]
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncoderConfig {
@@ -39,9 +162,7 @@ struct EncLayer {
 }
 
 pub struct Encoder {
-    conv1: Conv2d,
-    conv2: Conv2d,
-    conv3: Conv2d,
+    conv_stem: ConvStem,
     conv_out: Linear,
     layers: Vec<EncLayer>,
     ln_post: LayerNorm,
@@ -150,10 +271,27 @@ impl Encoder {
         // three stride-2 convolutions reduce height 128→64→32→16, so c_h=16, flat=480*16=7680.
         const CONV_CH: usize = 480;
         const CONV_FLAT: usize = 480 * 16;
-        let conv_cfg = Conv2dConfig { stride: 2, padding: 1, ..Default::default() };
-        let conv1   = conv2d(1,       CONV_CH, 3, conv_cfg, vb.pp("conv2d1"))?;
-        let conv2   = conv2d(CONV_CH, CONV_CH, 3, conv_cfg, vb.pp("conv2d2"))?;
-        let conv3   = conv2d(CONV_CH, CONV_CH, 3, conv_cfg, vb.pp("conv2d3"))?;
+
+        // Load conv weights as raw Vec<f32> for direct GEMM.
+        // Candle stores conv weights as [c_out, c_in, kh, kw], we need [c_out, c_in*kh*kw].
+        let conv1_w_tensor = vb.pp("conv2d1").get((CONV_CH, 1, 3, 3), "weight")?;
+        let conv1_weight: Vec<f32> = conv1_w_tensor.flatten_all()?.to_vec1()?;
+        let conv1_bias: Vec<f32> = vb.pp("conv2d1").get(CONV_CH, "bias")?.to_vec1()?;
+
+        let conv2_w_tensor = vb.pp("conv2d2").get((CONV_CH, CONV_CH, 3, 3), "weight")?;
+        let conv2_weight: Vec<f32> = conv2_w_tensor.flatten_all()?.to_vec1()?;
+        let conv2_bias: Vec<f32> = vb.pp("conv2d2").get(CONV_CH, "bias")?.to_vec1()?;
+
+        let conv3_w_tensor = vb.pp("conv2d3").get((CONV_CH, CONV_CH, 3, 3), "weight")?;
+        let conv3_weight: Vec<f32> = conv3_w_tensor.flatten_all()?.to_vec1()?;
+        let conv3_bias: Vec<f32> = vb.pp("conv2d3").get(CONV_CH, "bias")?.to_vec1()?;
+
+        let conv_stem = ConvStem {
+            conv1_weight, conv1_bias,
+            conv2_weight, conv2_bias,
+            conv3_weight, conv3_bias,
+        };
+
         let conv_out = linear_no_bias(CONV_FLAT, cfg.d_model, vb.pp("conv_out"))?;
 
         let mut layers = Vec::with_capacity(cfg.layers);
@@ -177,50 +315,103 @@ impl Encoder {
         let proj1   = linear(cfg.d_model, cfg.d_model,    vb.pp("proj1"))?;
         let proj2   = linear(cfg.d_model, cfg.output_dim, vb.pp("proj2"))?;
 
-        Ok(Encoder { conv1, conv2, conv3, conv_out, layers, ln_post, proj1, proj2, cfg })
+        Ok(Encoder { conv_stem, conv_out, layers, ln_post, proj1, proj2, cfg })
     }
 
     // Input mel: [128, mel_frames] (128 mel bins, F32)
     // Output:    [total_tokens, output_dim]
     pub fn forward(&self, mel: &Tensor) -> candle_core::Result<Tensor> {
+        self.forward_inner(mel, false).map(|(t, _, _)| t)
+    }
+
+    // Same as forward but returns timing breakdown (conv_stem_ms, transformer_ms)
+    pub fn forward_timed(&self, mel: &Tensor) -> candle_core::Result<(Tensor, f64, f64)> {
+        self.forward_inner(mel, true)
+    }
+
+    fn forward_inner(&self, mel: &Tensor, timed: bool) -> candle_core::Result<(Tensor, f64, f64)> {
+        use std::time::Instant;
+        let t0 = if timed { Some(Instant::now()) } else { None };
+
         let dev = mel.device();
         let mel_frames = mel.dims()[1];
         let chunk_size = self.cfg.chunk_size;
         let n_chunks = mel_frames.div_ceil(chunk_size);
 
-        // --- Conv2d stem: process each chunk independently ---
+        // Extract mel as flat f32 slice [128, mel_frames] row-major
+        let mel_data: Vec<f32> = mel.flatten_all()?.to_vec1()?;
+
+        // Conv stem constants
+        const CONV_CH: usize = 480;
+        const MEL_BINS: usize = 128;
+
+        // --- Conv2d stem: process chunks in parallel using custom im2col + GEMM ---
+        // Process conv stem (3 conv layers) in parallel across chunks, then project sequentially
+        let conv_results: Vec<_> = (0..n_chunks)
+            .into_par_iter()
+            .map(|c| {
+                let start = c * chunk_size;
+                let chunk_w = chunk_size.min(mel_frames - start);
+
+                // Extract chunk: [1, 128, chunk_w] (c_in=1, h=128, w=chunk_w)
+                let mut chunk_mel = vec![0.0f32; MEL_BINS * chunk_w];
+                for m in 0..MEL_BINS {
+                    for w in 0..chunk_w {
+                        chunk_mel[m * chunk_w + w] = mel_data[m * mel_frames + start + w];
+                    }
+                }
+
+                // Conv1: [1, 128, chunk_w] -> [480, h1, w1]
+                let (mut x, h1, w1) = conv2d_gemm(
+                    &chunk_mel, &self.conv_stem.conv1_weight, &self.conv_stem.conv1_bias,
+                    1, CONV_CH, MEL_BINS, chunk_w, 3, 3, 2, 1,
+                );
+                gelu_inplace(&mut x);
+
+                // Conv2: [480, h1, w1] -> [480, h2, w2]
+                let (mut x, h2, w2) = conv2d_gemm(
+                    &x, &self.conv_stem.conv2_weight, &self.conv_stem.conv2_bias,
+                    CONV_CH, CONV_CH, h1, w1, 3, 3, 2, 1,
+                );
+                gelu_inplace(&mut x);
+
+                // Conv3: [480, h2, w2] -> [480, h3, w3]
+                let (mut x, h3, w3) = conv2d_gemm(
+                    &x, &self.conv_stem.conv3_weight, &self.conv_stem.conv3_bias,
+                    CONV_CH, CONV_CH, h2, w2, 3, 3, 2, 1,
+                );
+                gelu_inplace(&mut x);
+
+                // Reshape [480, 16, w3] -> [w3, 7680]
+                let mut reshaped = vec![0.0f32; w3 * CONV_CH * h3];
+                for t in 0..w3 {
+                    for ch in 0..CONV_CH {
+                        for f in 0..h3 {
+                            reshaped[t * CONV_CH * h3 + ch * h3 + f] =
+                                x[ch * h3 * w3 + f * w3 + t];
+                        }
+                    }
+                }
+                (reshaped, w3, h3)
+            })
+            .collect();
+
+        // Project and add PE sequentially (requires Tensor operations)
         let mut chunks: Vec<Tensor> = Vec::with_capacity(n_chunks);
         let mut tokens_per_ref_chunk: usize = 0;
 
-        for c in 0..n_chunks {
-            let start = c * chunk_size;
-            let chunk_w = chunk_size.min(mel_frames - start);
-
-            // [128, chunk_w] → [1, 1, 128, chunk_w]  (batch=1, in_ch=1)
-            let x = mel.narrow(1, start, chunk_w)?.unsqueeze(0)?.unsqueeze(0)?;
-
-            // Three stride-2 Conv2d + GELU  →  [1, 480, 16, w3]
-            let x = self.conv1.forward(&x)?.gelu()?;
-            let x = self.conv2.forward(&x)?.gelu()?;
-            let x = self.conv3.forward(&x)?.gelu()?;
-
-            let dims = x.dims(); // [1, c_ch, c_h, w3]
-            let (c_ch, c_h, w3) = (dims[1], dims[2], dims[3]);
+        for (c, (reshaped, w3, h3)) in conv_results.into_iter().enumerate() {
             if c == 0 {
                 tokens_per_ref_chunk = w3;
             }
-
-            // [1, 480, 16, w3] → permute → [1, w3, 480, 16] → [w3, 7680]
-            let x = x
-                .permute([0, 3, 1, 2])?
-                .contiguous()?
-                .reshape((w3, c_ch * c_h))?;
-
-            // Project to d_model (no bias), add per-chunk sinusoidal PE
-            let x = self.conv_out.forward(&x)?;
+            let x_tensor = Tensor::from_vec(reshaped, (w3, CONV_CH * h3), dev)?;
+            let x_proj = self.conv_out.forward(&x_tensor)?;
             let pe = sinusoidal_pe(w3, self.cfg.d_model, dev)?;
-            chunks.push((x + pe)?);
+            chunks.push((x_proj + pe)?);
         }
+
+        let conv_stem_ms = t0.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+        let t1 = if timed { Some(std::time::Instant::now()) } else { None };
 
         // --- Transformer ---
         let mut x = Tensor::cat(&chunks, 0)?; // [total_tokens, d_model]
@@ -238,7 +429,10 @@ impl Encoder {
         // --- Head ---
         let x = self.ln_post.forward(&x)?;
         let x = self.proj1.forward(&x)?.gelu()?;
-        Ok(self.proj2.forward(&x)?)
+        let out = self.proj2.forward(&x)?;
+
+        let transformer_ms = t1.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+        Ok((out, conv_stem_ms, transformer_ms))
     }
 }
 
@@ -255,9 +449,9 @@ impl std::fmt::Display for Encoder {
         }
 
         writeln!(f, "Encoder {{")?;
-        writeln!(f, "  conv1    weight [{}]{}", s(self.conv1.weight()), bias(self.conv1.bias()))?;
-        writeln!(f, "  conv2    weight [{}]{}", s(self.conv2.weight()), bias(self.conv2.bias()))?;
-        writeln!(f, "  conv3    weight [{}]{}", s(self.conv3.weight()), bias(self.conv3.bias()))?;
+        writeln!(f, "  conv1    weight [480×9]  bias [480]")?;
+        writeln!(f, "  conv2    weight [480×4320]  bias [480]")?;
+        writeln!(f, "  conv3    weight [480×4320]  bias [480]")?;
         writeln!(f, "  conv_out weight [{}]{}", s(self.conv_out.weight()), bias(self.conv_out.bias()))?;
         writeln!(f, "  layers   {} ×", self.layers.len())?;
         if let Some(l) = self.layers.first() {
