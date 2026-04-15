@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+gemm = "0.19"
 thiserror = "2.0.18"
 tokenizers = { version = "0.22", default-features = false }
 serde_json = "1.0.149"

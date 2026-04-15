@@ -1247,6 +1247,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "clap",
+ "gemm",
  "hound",
  "num_cpus",
  "rayon",
