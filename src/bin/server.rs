@@ -4,6 +4,8 @@
 //!   GET  /          — built-in HTML status page
 //!   POST /inference — transcribe uploaded audio, returns JSON or plain text
 //!   POST /load      — hot-swap the loaded model directory at runtime
+//!   POST /prompt    — set or clear system prompt (bias transcription)
+//!   GET  /prompt    — get current system prompt
 //!   GET  /health    — readiness probe
 //!
 //! Requests are serialized: only one inference runs at a time.
@@ -50,6 +52,10 @@ struct Args {
     /// Default forced language (empty = auto-detect)
     #[arg(long, default_value = "")]
     language: String,
+
+    /// System prompt for biasing (e.g. "Preserve spelling: CPU, CUDA, PostgreSQL")
+    #[arg(long, default_value = "")]
+    prompt: String,
 
     /// Directory for static files (serves index.html at GET /)
     #[arg(long)]
@@ -288,6 +294,62 @@ async fn post_load(
     }
 }
 
+async fn get_prompt(State(shared): State<Shared>) -> Response {
+    let st = shared.lock().unwrap();
+    let pipeline = match st.pipeline.as_ref() {
+        Some(p) => p,
+        None => return json_err(StatusCode::SERVICE_UNAVAILABLE, "model not loaded"),
+    };
+    let prompt = pipeline.prompt().unwrap_or("");
+    json_ok(json!({"prompt": prompt}))
+}
+
+async fn post_prompt(
+    State(shared): State<Shared>,
+    mut multipart: Multipart,
+) -> Response {
+    // ── Collect prompt text ──────────────────────────────────────────────────
+    let mut new_prompt: Option<String> = None;
+
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                if field.name() == Some("prompt") {
+                    new_prompt = Some(field.text().await.unwrap_or_default());
+                } else {
+                    let _ = field.bytes().await;
+                }
+            }
+            Ok(None) => break,
+            Err(e) => return json_err(StatusCode::BAD_REQUEST,
+                                      &format!("multipart error: {e}")),
+        }
+    }
+
+    let prompt_text = new_prompt.unwrap_or_default();
+    let is_clear = prompt_text.is_empty();
+
+    let mut st = shared.lock().unwrap();
+    let pipeline = match st.pipeline.as_mut() {
+        Some(p) => p,
+        None => return json_err(StatusCode::SERVICE_UNAVAILABLE, "model not loaded"),
+    };
+
+    match pipeline.set_prompt(if is_clear { None } else { Some(&prompt_text) }) {
+        Ok(()) => {
+            if is_clear {
+                eprintln!("Prompt cleared");
+                json_ok(json!({"status": "prompt cleared"}))
+            } else {
+                eprintln!("Prompt set: {}", prompt_text);
+                json_ok(json!({"status": "prompt set", "prompt": prompt_text}))
+            }
+        }
+        Err(e) => json_err(StatusCode::INTERNAL_SERVER_ERROR,
+                          &format!("failed to set prompt: {e}")),
+    }
+}
+
 // ── main ──────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -302,8 +364,14 @@ async fn main() {
     }
 
     eprintln!("Loading model from {} ...", args.model_dir.display());
-    let pipeline = Pipeline::load(&args.model_dir)
+    let mut pipeline = Pipeline::load(&args.model_dir)
         .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(1) });
+
+    if !args.prompt.is_empty() {
+        pipeline.set_prompt(Some(&args.prompt))
+            .unwrap_or_else(|e| { eprintln!("error setting prompt: {e}"); std::process::exit(1) });
+        eprintln!("Prompt: {}", args.prompt);
+    }
 
     let index_html = args.public.as_deref().map(|p| p.join("index.html")).and_then(|p| {
         match std::fs::read_to_string(&p) {
@@ -324,6 +392,7 @@ async fn main() {
         .route("/health",    get(get_health))
         .route("/inference", post(post_inference).options(options_inference))
         .route("/load",      post(post_load))
+        .route("/prompt",    get(get_prompt).post(post_prompt))
         .layer(middleware::from_fn(cors_middleware))
         .with_state(shared);
 

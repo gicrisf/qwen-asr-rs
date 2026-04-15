@@ -43,6 +43,10 @@ pub struct Pipeline {
     pub decoder:   Decoder,
     pub tokenizer: Tokenizer,
     pub audio_cfg: AudioConfig,
+    /// Optional system prompt text.
+    prompt: Option<String>,
+    /// Cached token IDs for the prompt (empty if no prompt).
+    prompt_tokens: Vec<u32>,
 }
 
 impl Pipeline {
@@ -56,7 +60,34 @@ impl Pipeline {
         let decoder   = Decoder::load(&shards, &cfg.decoder, &dev)?;
         let tokenizer = Tokenizer::load(model_dir)?;
 
-        Ok(Self { encoder, decoder, tokenizer, audio_cfg: cfg.audio })
+        Ok(Self {
+            encoder,
+            decoder,
+            tokenizer,
+            audio_cfg: cfg.audio,
+            prompt: None,
+            prompt_tokens: Vec::new(),
+        })
+    }
+
+    /// Set the system prompt text. Pass `None` or empty string to clear.
+    pub fn set_prompt(&mut self, prompt: Option<&str>) -> Result<(), TranscribeError> {
+        match prompt {
+            Some(p) if !p.is_empty() => {
+                self.prompt_tokens = self.tokenizer.encode(p)?;
+                self.prompt = Some(p.to_string());
+            }
+            _ => {
+                self.prompt = None;
+                self.prompt_tokens.clear();
+            }
+        }
+        Ok(())
+    }
+
+    /// Get the current system prompt, if any.
+    pub fn prompt(&self) -> Option<&str> {
+        self.prompt.as_deref()
     }
 
     /// Transcribe a WAV file to text.
@@ -89,8 +120,9 @@ impl Pipeline {
         let t_dec = Instant::now();
 
         let prefix_ids: Vec<u32> = PROMPT_PREFIX_HEAD.iter()
-            .chain(PROMPT_PREFIX_TAIL.iter())
             .copied()
+            .chain(self.prompt_tokens.iter().copied())
+            .chain(PROMPT_PREFIX_TAIL.iter().copied())
             .collect();
         let prefix_len = prefix_ids.len();
         let prefix_t   = Tensor::from_vec(prefix_ids, (1, prefix_len), &dev)?;
