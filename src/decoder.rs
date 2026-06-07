@@ -218,7 +218,7 @@ pub struct Decoder {
     layers: Vec<DecLayer>,
     norm:     RmsNorm,
     lm_head:  Linear,
-    cfg: Qwen3Config,
+    // cfg: Qwen3Config,
 }
 
 impl Decoder {
@@ -240,7 +240,7 @@ impl Decoder {
         }
         let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?;
 
-        Ok(Self { embed_tokens, layers, norm, lm_head, cfg: cfg.clone() })
+        Ok(Self { embed_tokens, layers, norm, lm_head /*, cfg: cfg.clone() */ })
     }
 
     /// Look up token embeddings: `[b, seq]` → `[b, seq, hidden]`.
