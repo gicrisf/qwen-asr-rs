@@ -142,7 +142,7 @@ The cold-start advantage comes mostly from faster model loading via mmap.
 
 Warm inference is within ~7% of libtorch. Both beat real-time on this mid-range laptop.
 
-**For a further ~28% speedup** over libtorch at warm inference, see the [bf16-gemm branch](https://github.com/gicrisf/qwen-asr-rs/tree/bf16-gemm) which uses a [custom candle fork](https://github.com/gicrisf/candle) with mixed-precision BF16 GEMM ([upstream PR pending](https://github.com/sarah-quinones/gemm/pull/40)).
+**Experimental [bf16-gemm branch](https://github.com/gicrisf/qwen-asr-rs/tree/bf16-gemm):** ~22% faster on short audio (< ~30s) via mixed-precision BF16 GEMM. Uses a [custom candle fork](https://github.com/gicrisf/candle) and a [forked gemm crate](https://github.com/gicrisf/gemm) ([upstream PR](https://github.com/sarah-quinones/gemm/pull/40)). **Known issue:** BF16 attention precision breaks on long audio (> ~200 encoder tokens).
 
 ## Credits
 
